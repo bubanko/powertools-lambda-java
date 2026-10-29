@@ -23,13 +23,19 @@ import com.amazonaws.services.lambda.runtime.tests.annotations.Event;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.mockito.Mock;
 import software.amazon.lambda.powertools.batch.handler.BatchMessageHandler;
@@ -94,9 +100,17 @@ class SQSBatchProcessorTest {
     private SQSBatchResponse testParallelBatchExecution(SQSEvent event,
                                                         BiConsumer<SQSEvent.SQSMessage, Context> messageHandler,
                                                         Executor executor) {
+        return testParallelBatchExecution(event, messageHandler, null, executor);
+    }
+
+    private SQSBatchResponse testParallelBatchExecution(SQSEvent event,
+                                                        BiConsumer<SQSEvent.SQSMessage, Context> messageHandler,
+                                                        BiConsumer<SQSEvent.SQSMessage, Throwable> failureHandler,
+                                                        Executor executor) {
         // Arrange
         BatchMessageHandler<SQSEvent, SQSBatchResponse> handler = new BatchMessageHandlerBuilder()
                 .withSqsBatchHandler()
+                .withFailureHandler(failureHandler)
                 .buildWithRawMessageHandler(messageHandler);
 
         // Act
@@ -162,6 +176,38 @@ class SQSBatchProcessorTest {
         SQSBatchResponse.BatchItemFailure batchItemFailure = sqsBatchResponse.getBatchItemFailures().get(0);
         assertThat(batchItemFailure.getItemIdentifier()).isEqualTo("e9144555-9a4f-4ec3-99a0-34ce359b4b54");
         assertThat(threadList).hasSizeGreaterThan(1);
+    }
+
+    @Test
+    void parallelBatchProcessing_shouldBeThreadSafe() {
+        List<SQSEvent.SQSMessage> messages = IntStream.range(0, 1000).mapToObj(i -> {
+            SQSEvent.SQSMessage sqsMessage = new SQSEvent.SQSMessage();
+            sqsMessage.setMessageId(String.valueOf(i));
+            sqsMessage.setAttributes(Collections.emptyMap());
+            return sqsMessage;
+        }).collect(Collectors.toList());
+        SQSEvent event = new SQSEvent();
+        event.setRecords(messages);
+        List<String> batchItemFailureIds;
+        CyclicBarrier barrier = new CyclicBarrier(10);
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        try {
+            SQSBatchResponse sqsBatchResponse = testParallelBatchExecution(event, (message, context) -> {
+                throw new RuntimeException("fake exception");
+            }, (message, throwable) -> {
+                try {
+                    barrier.await();
+                } catch (InterruptedException | BrokenBarrierException e) {
+                    throw new RuntimeException(e);
+                }
+            }, executor);
+            batchItemFailureIds = sqsBatchResponse.getBatchItemFailures().stream().map(
+                    SQSBatchResponse.BatchItemFailure::getItemIdentifier).collect(Collectors.toList());
+        } finally {
+            executor.shutdown();
+        }
+        Set<String> messageIds = messages.stream().map(SQSEvent.SQSMessage::getMessageId).collect(Collectors.toSet());
+        assertThat(batchItemFailureIds).containsExactlyInAnyOrderElementsOf(messageIds);
     }
 
     @ParameterizedTest
